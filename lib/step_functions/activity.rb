@@ -343,6 +343,7 @@ module StepFunctions
           begin
             @states.send_task_failure(
               task_token: activity_task.task_token,
+              error: error.class.to_s,
               cause: error.message
             )
           rescue => e
