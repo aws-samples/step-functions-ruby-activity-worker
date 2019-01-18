@@ -372,7 +372,9 @@ module StepFunctions
       def send_heartbeat(token)
         StepFunctions.with_retries(max_retry: @max_retry) do
           begin
-            @states.send_task_heartbeat(token)
+            @states.send_task_heartbeat(
+              task_token: token
+            )
           rescue => e
             @logger.error('Failed to send heartbeat for activity')
             @logger.error(e)
