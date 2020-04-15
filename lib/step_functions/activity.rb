@@ -122,9 +122,10 @@ module StepFunctions
     def start(&block)
       @sink = SizedQueue.new(@queue_max)
       @activities = Set.new
-      start_heartbeat_worker(@activities)
-      start_workers(@activities, block, @sink)
-      start_pollers(@activities, @sink)
+      @mutex = Mutex.new
+      start_heartbeat_worker(@activities, @mutex)
+      start_workers(@activities, @mutex, block, @sink)
+      start_pollers(@activities, @mutex, @sink)
       wait
     end
 
@@ -145,9 +146,10 @@ module StepFunctions
 
     private
 
-    def start_pollers(activities, sink)
+    def start_pollers(activities, mutex, sink)
       @pollers = Array.new(@pollers_count) do
         PollerWorker.new(
+          mutex: mutex,
           states: @states,
           activity_arn: @activity_arn,
           sink: sink,
@@ -158,9 +160,10 @@ module StepFunctions
       @pollers.each(&:start)
     end
 
-    def start_workers(activities, block, sink)
+    def start_workers(activities, mutex, block, sink)
       @workers = Array.new(@workers_count) do
         ActivityWorker.new(
+          mutex: mutex,
           states: @states,
           block: block,
           sink: sink,
@@ -171,9 +174,10 @@ module StepFunctions
       @workers.each(&:start)
     end
 
-    def start_heartbeat_worker(activities)
+    def start_heartbeat_worker(activities, mutex)
       @heartbeat_worker = HeartbeatWorker.new(
         states: @states,
+        mutex: mutex,
         activities: activities,
         heartbeat_delay: @heartbeat_delay,
         max_retry: @max_retry
@@ -218,7 +222,9 @@ module StepFunctions
     end
 
     def wait_activities_completed
-      wait_condition { @activities.empty? }
+      wait_condition do
+        @mutex.synchronize { @activities.empty? }
+      end
     end
 
     def wait_condition(&block)
@@ -281,6 +287,7 @@ module StepFunctions
 
     class PollerWorker < Worker
       def initialize(options = {})
+        @mutex = options[:mutex]
         @states = options[:states]
         @activity_arn = options[:activity_arn]
         @sink = options[:sink]
@@ -299,13 +306,16 @@ module StepFunctions
           end
         end
         return if activity_task.nil? || activity_task.task_token.nil?
-        @activities.add(activity_task.task_token)
+
+        @mutex.synchronize { @activities.add(activity_task.task_token) }
+
         @sink.push(activity_task)
       end
     end
 
     class ActivityWorker < Worker
       def initialize(options = {})
+        @mutex = options[:mutex]
         @states = options[:states]
         @block = options[:block]
         @sink = options[:sink]
@@ -321,7 +331,9 @@ module StepFunctions
       rescue => e
         send_task_failure(activity_task, e)
       ensure
-        @activities.delete(activity_task.task_token) unless activity_task.nil?
+        @mutex.synchronize do
+          @activities.delete(activity_task.task_token) unless activity_task.nil?
+        end
       end
 
       def send_task_success(activity_task, result)
@@ -355,6 +367,7 @@ module StepFunctions
 
     class HeartbeatWorker < Worker
       def initialize(options = {})
+        @mutex = options[:mutex]
         @states = options[:states]
         @activities = options[:activities]
         @heartbeat_delay = options[:heartbeat_delay]
@@ -364,7 +377,9 @@ module StepFunctions
 
       def run
         sleep(@heartbeat_delay)
-        @activities.each do |token|
+        heartbeat_tokens = @mutex.synchronize { @activities.dup }
+
+        heartbeat_tokens.each do |token|
           send_heartbeat(token)
         end
       end
@@ -372,7 +387,7 @@ module StepFunctions
       def send_heartbeat(token)
         StepFunctions.with_retries(max_retry: @max_retry) do
           begin
-            @states.send_task_heartbeat(token)
+            @states.send_task_heartbeat(task_token: token)
           rescue => e
             @logger.error('Failed to send heartbeat for activity')
             @logger.error(e)
